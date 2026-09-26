@@ -1,3 +1,14 @@
+> [!NOTE]
+> ## `cap/kitty-keyboard` — skip stacked kitty keyboard protocol
+>
+> Durable local capability: when the herdr client is already inside kitty (`KITTY_WINDOW_ID`), do not push or pop the kitty keyboard protocol. Kitty already implements it; a second push stacks encoding so Enter and Backspace register twice.
+>
+> - **Daily composition:** [`master`](https://github.com/atacolak/herdr/tree/master)
+> - **Upstream issue:** [#4618](https://github.com/herdrdev/herdr/issues/4618) — Enter and Backspace fire twice under kitty 0.48
+> - **Upstream base:** [Herdr 0.9.1 (`8ac95427`)](https://github.com/herdrdev/herdr/tree/8ac9542757292f7a8d42a2d532bc6a8a33c7ffce)
+>
+> PR heads stay independently reviewable without this banner.
+
 # herdr
 
 

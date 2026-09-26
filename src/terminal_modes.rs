@@ -38,10 +38,26 @@ pub(crate) fn set_windows_mouse_reporting<W: Write>(
 }
 
 #[cfg(not(windows))]
+pub(crate) fn host_terminal_is_kitty() -> bool {
+    // Kitty implements the keyboard protocol itself. Pushing it again from
+    // inside a kitty window stacks a second encoding on enter and backspace,
+    // so those keys register twice. Kitty's own state is the one to keep.
+    std::env::var_os("KITTY_WINDOW_ID").is_some()
+}
+
+#[cfg(windows)]
+pub(crate) fn host_terminal_is_kitty() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
 pub(crate) fn set_host_kitty_keyboard_report_all<W: Write>(
     writer: &mut W,
     report_all_keys: bool,
 ) -> io::Result<()> {
+    if host_terminal_is_kitty() {
+        return Ok(());
+    }
     let mut flags = crate::input::ime_compatible_keyboard_enhancement_flags();
     if report_all_keys {
         flags |= crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
@@ -122,14 +138,47 @@ mod tests {
     use super::*;
 
     #[cfg(not(windows))]
+    fn with_kitty_window_id<R>(present: bool, f: impl FnOnce() -> R) -> R {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("KITTY_WINDOW_ID test lock");
+        let previous = std::env::var_os("KITTY_WINDOW_ID");
+        if present {
+            std::env::set_var("KITTY_WINDOW_ID", "1");
+        } else {
+            std::env::remove_var("KITTY_WINDOW_ID");
+        }
+        let result = f();
+        match previous {
+            Some(value) => std::env::set_var("KITTY_WINDOW_ID", value),
+            None => std::env::remove_var("KITTY_WINDOW_ID"),
+        }
+        result
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn host_keyboard_report_all_replaces_the_current_herdr_stack_entry() {
-        let mut output = Vec::new();
+        with_kitty_window_id(false, || {
+            let mut output = Vec::new();
 
-        set_host_kitty_keyboard_report_all(&mut output, true).unwrap();
-        set_host_kitty_keyboard_report_all(&mut output, false).unwrap();
+            set_host_kitty_keyboard_report_all(&mut output, true).unwrap();
+            set_host_kitty_keyboard_report_all(&mut output, false).unwrap();
 
-        assert_eq!(output, b"\x1b[<1u\x1b[>31u\x1b[<1u\x1b[>7u");
+            assert_eq!(output, b"\x1b[<1u\x1b[>31u\x1b[<1u\x1b[>7u");
+        });
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn host_keyboard_report_all_is_a_noop_inside_kitty() {
+        with_kitty_window_id(true, || {
+            let mut output = Vec::new();
+
+            set_host_kitty_keyboard_report_all(&mut output, true).unwrap();
+            set_host_kitty_keyboard_report_all(&mut output, false).unwrap();
+
+            assert!(output.is_empty());
+        });
     }
 
     #[cfg(not(windows))]

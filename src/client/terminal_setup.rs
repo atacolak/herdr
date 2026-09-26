@@ -75,8 +75,10 @@ pub(super) fn setup_terminal_with_capabilities(
         };
 
     let (host_escape_disambiguation_active, buffered_host_input) = if enable_client_protocols {
-        terminal_guard.reset_keyboard_enhancements = true;
-        push_keyboard_enhancement_flags()?;
+        if !crate::terminal_modes::host_terminal_is_kitty() {
+            terminal_guard.reset_keyboard_enhancements = true;
+            push_keyboard_enhancement_flags()?;
+        }
         let (active, buffered_input) = query_host_escape_disambiguation();
         set_mouse_capture(mouse_capture, false)?;
         execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;

@@ -6,6 +6,7 @@
 > - **Upstream base:** [Herdr 0.9.1 (`8ac95427`)](https://github.com/herdrdev/herdr/tree/8ac9542757292f7a8d42a2d532bc6a8a33c7ffce)
 > - **Capabilities:**
 >   - [`cap/kitty-keyboard`](https://github.com/atacolak/herdr/tree/cap/kitty-keyboard) — skip stacking kitty keyboard protocol when already inside kitty
+>   - [`cap/path-links`](https://github.com/atacolak/herdr/tree/cap/path-links) — underline, hover, and Ctrl+Click plain-text file paths and non-web OSC 8 links through plugin link handlers
 >
 > Rebuild from upstream `master` + current `cap/*` tips. Do not implement features here.
 

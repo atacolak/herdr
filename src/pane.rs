@@ -3360,8 +3360,25 @@ impl PaneRuntime {
         self.terminal.link_regions_at(col, row, resolve)
     }
 
+    pub(crate) fn link_regions_at_with(
+        &self,
+        col: u16,
+        row: u16,
+        resolve: impl Fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.terminal.link_regions_at_with(col, row, resolve)
+    }
+
     pub(crate) fn link_target_at(&self, col: u16, row: u16) -> Option<crate::ghostty::LinkTarget> {
         self.terminal.link_target_at(col, row)
+    }
+
+    pub(crate) fn uri_link_regions_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.terminal.uri_link_regions_at(col, row)
     }
 
     pub(crate) fn kitty_graphics_may_have_placements(&self) -> bool {

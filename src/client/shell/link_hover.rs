@@ -257,7 +257,10 @@ impl ClientShellState {
         let hyperlink = hyperlink_at(target.col, target.row)?;
         let uri = surface.frame.hyperlinks.get(hyperlink as usize)?;
         if crate::app::actions::safe_web_url(uri).is_none() {
-            return Some(Vec::new());
+            // Non-web destinations (for example `file://`) may still be handled
+            // by an installed plugin link handler. Delegate to the server instead
+            // of claiming the hover is resolved with no regions.
+            return None;
         }
         let width = usize::from(rect.width);
         if width == 0 {

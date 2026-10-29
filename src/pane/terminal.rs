@@ -555,8 +555,25 @@ impl PaneTerminal {
         self.ghostty.link_regions_at(col, row, resolve)
     }
 
+    pub(crate) fn link_regions_at_with(
+        &self,
+        col: u16,
+        row: u16,
+        resolve: impl Fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.ghostty.link_regions_at_with(col, row, resolve)
+    }
+
     pub(crate) fn link_target_at(&self, col: u16, row: u16) -> Option<crate::ghostty::LinkTarget> {
         self.ghostty.link_target_at(col, row)
+    }
+
+    pub(crate) fn uri_link_regions_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.ghostty.uri_link_regions_at(col, row)
     }
 
     pub(crate) fn kitty_graphics_may_have_placements(&self) -> bool {
@@ -2242,6 +2259,15 @@ impl GhosttyPaneTerminal {
         row: u16,
         resolve: fn(&str, usize) -> Option<std::ops::Range<usize>>,
     ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        self.link_regions_at_with(col, row, resolve)
+    }
+
+    pub(crate) fn link_regions_at_with(
+        &self,
+        col: u16,
+        row: u16,
+        resolve: impl Fn(&str, usize) -> Option<std::ops::Range<usize>>,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
         self.core
             .lock()
             .ok()
@@ -2261,6 +2287,87 @@ impl GhosttyPaneTerminal {
             .viewport_link_target(col, u32::from(row))
             .ok()
             .flatten()
+    }
+
+    /// Viewport-wide regions for the OSC 8 destination under `(col, row)`.
+    ///
+    /// Only reached on explicit link resolution, so a single viewport scan is
+    /// acceptable here; contiguous cells sharing the destination form one run.
+    pub(crate) fn uri_link_regions_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Vec<crate::api::schema::PaneLinkRegion> {
+        let (cols, rows) = {
+            let Ok(core) = self.core.lock() else {
+                return Vec::new();
+            };
+            match (core.terminal.cols(), core.terminal.rows()) {
+                (Ok(cols), Ok(rows)) if cols > 0 && rows > 0 => (cols, rows),
+                _ => return Vec::new(),
+            }
+        };
+        if col >= cols || row >= rows {
+            return Vec::new();
+        }
+        let links = self.visible_hyperlinks(Rect::new(0, 0, cols, rows));
+        let Some(uri) = links
+            .iter()
+            .find(|((x, y), _, _)| *x == col && *y == row)
+            .map(|(_, _, uri)| uri.clone())
+        else {
+            return Vec::new();
+        };
+        let width = usize::from(cols);
+        let total = width * usize::from(rows);
+        let mut matching = std::collections::HashSet::new();
+        for ((x, y), _, candidate) in &links {
+            if candidate == &uri {
+                matching.insert(usize::from(*y) * width + usize::from(*x));
+            }
+        }
+        let clicked = usize::from(row) * width + usize::from(col);
+        if !matching.contains(&clicked) {
+            // Rendered wide-cell spacers may not carry their own OSC 8 metadata.
+            let previous = clicked.saturating_sub(1);
+            if col == 0 || !matching.contains(&previous) {
+                return Vec::new();
+            }
+        }
+        let mut start = clicked;
+        let mut end = clicked;
+        let mut remaining = 8191usize;
+        while start > 0 && matching.contains(&(start - 1)) {
+            if remaining == 0 {
+                return Vec::new();
+            }
+            remaining -= 1;
+            start -= 1;
+        }
+        while end + 1 < total && matching.contains(&(end + 1)) {
+            if remaining == 0 {
+                return Vec::new();
+            }
+            remaining -= 1;
+            end += 1;
+        }
+        let first_row = start / width;
+        let last_row = end / width;
+        (first_row..=last_row)
+            .map(|line| crate::api::schema::PaneLinkRegion {
+                row: line as u16,
+                start_col: if line == first_row {
+                    (start % width) as u16
+                } else {
+                    0
+                },
+                end_col: if line == last_row {
+                    (end % width) as u16
+                } else {
+                    cols - 1
+                },
+            })
+            .collect()
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {

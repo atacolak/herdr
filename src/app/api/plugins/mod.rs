@@ -2,6 +2,7 @@ mod context;
 mod env;
 mod manifest;
 mod panes;
+mod path_link;
 mod runtime;
 
 use super::responses::{encode_error, encode_success};
@@ -13,6 +14,7 @@ use crate::api::schema::{
     PluginUnlinkParams, ResponseResult,
 };
 use crate::app::App;
+use path_link::PathLinkResolver;
 pub(super) use manifest::normalize_plugin_id;
 use manifest::{
     effective_platforms, ensure_platform_supported, normalize_action_id, normalize_plugin_source,
@@ -318,8 +320,26 @@ impl App {
         id: String,
         params: PaneLinkActivateParams,
     ) -> String {
+        let resolver = self.path_link_resolver(&params.pane_id);
         match self.read_checked_pane_link(&id, &params, "resolution", |runtime, col, row| {
-            runtime.link_regions_at(col, row, crate::app::actions::url_byte_range)
+            if let Some(crate::ghostty::LinkTarget::Uri(uri)) = runtime.link_target_at(col, row) {
+                let allowed = crate::app::actions::safe_web_url(&uri).is_some()
+                    || resolver.has_handler(&uri);
+                return if allowed {
+                    runtime.uri_link_regions_at(col, row)
+                } else {
+                    Vec::new()
+                };
+            }
+            let mut regions =
+                runtime.link_regions_at(col, row, crate::app::actions::url_byte_range);
+            if regions.is_empty() {
+                regions = runtime.link_regions_at_with(col, row, |text, clicked_byte| {
+                    crate::app::actions::path_byte_range(text, clicked_byte)
+                        .filter(|range| resolver.is_path_link(&text[range.clone()]))
+                });
+            }
+            regions
         }) {
             Ok((_, regions)) => encode_success(id, ResponseResult::PaneLinkResolved { regions }),
             Err(error) => error,
@@ -331,11 +351,17 @@ impl App {
         id: String,
         params: PaneLinkActivateParams,
     ) -> String {
+        let resolver = self.path_link_resolver(&params.pane_id);
         let (pane_id, url) =
             match self.read_checked_pane_link(&id, &params, "activation", |runtime, col, row| {
-                runtime
-                    .link_target_at(col, row)
-                    .and_then(crate::app::actions::url_from_link_target)
+                runtime.link_target_at(col, row).and_then(|target| {
+                    crate::app::actions::url_from_link_target(target).or_else(|| {
+                        runtime
+                            .link_target_at(col, row)
+                            .and_then(crate::app::actions::path_candidate_from_link_target)
+                            .filter(|candidate| resolver.is_path_link(candidate))
+                    })
+                })
             }) {
                 Ok(value) => value,
                 Err(error) => return error,
@@ -662,11 +688,54 @@ impl App {
         }
     }
 
+    /// Snapshots everything a path link check needs so hover never re-reads
+    /// state, spawns plugins, or probes the filesystem more than once per cell.
+    fn path_link_resolver(&self, public_pane_id: &str) -> PathLinkResolver {
+        let cwd = self
+            .parse_pane_id(public_pane_id)
+            .and_then(|(ws_idx, pane_id)| self.pane_info(ws_idx, pane_id))
+            .and_then(|pane| pane.cwd)
+            .map(std::path::PathBuf::from);
+        let mut patterns = Vec::new();
+        let mut plugins = self
+            .state
+            .installed_plugins
+            .values()
+            .filter(|plugin| plugin.enabled && plugin_manifest_available(plugin))
+            .collect::<Vec<_>>();
+        plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+        for plugin in plugins {
+            for handler in &plugin.link_handlers {
+                if ensure_platform_supported(
+                    &effective_platforms(&handler.platforms, &plugin.platforms).clone(),
+                    &handler.id,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                if !plugin.actions.iter().any(|action| {
+                    action.id == handler.action
+                        && ensure_platform_supported(
+                            &effective_platforms(&action.platforms, &plugin.platforms).clone(),
+                            &action.id,
+                        )
+                        .is_ok()
+                }) {
+                    continue;
+                }
+                if let Ok(regex) = regex::Regex::new(&handler.pattern) {
+                    patterns.push(regex);
+                }
+            }
+        }
+        PathLinkResolver::new(cwd, patterns)
+    }
+
     fn find_plugin_link_handler(
         &self,
         url: &str,
-    ) -> Option<(InstalledPluginInfo, PluginManifestLinkHandler)> {
-        let mut plugins = self
+    ) -> Option<(InstalledPluginInfo, PluginManifestLinkHandler)> {        let mut plugins = self
             .state
             .installed_plugins
             .values()
@@ -876,6 +945,304 @@ mod tests {
         let response: serde_json::Value =
             serde_json::from_str(&app.handle_pane_link_resolve("hover".into(), params)).unwrap();
         assert_eq!(response["error"]["code"], "stale_target");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_link_hover_resolves_existing_plain_text_path_when_plugin_matches() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("path-hover")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let root = unique_temp_path("pane-link-path-hover");
+        let directory = root.join("src");
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("open.ts");
+        std::fs::write(&file, "export {}\n").unwrap();
+
+        let plugin_root = unique_temp_path("pane-link-path-hover-plugin");
+        write_manifest_content(
+            &plugin_root,
+            r#"
+id = "example.path-hover"
+name = "Path Hover"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Open path"
+command = ["true"]
+
+[[link_handlers]]
+id = "file-path"
+title = "Open file path"
+pattern = "^(/|~/|\\./|\\.\\./|[A-Za-z0-9._-]+/)"
+action = "open"
+"#,
+        );
+        link_manifest(&mut app, &plugin_root);
+
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 4);
+        runtime.test_process_pty_bytes(
+            format!("inspect {}:12:3 and more", file.display()).as_bytes(),
+        );
+        let revision = runtime.content_seq();
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        let params = PaneLinkActivateParams {
+            pane_id: public_id,
+            viewport_row: 0,
+            col: 10,
+            content_revision: Some(revision),
+            offset_from_bottom: Some(0),
+        };
+        let response = app.handle_pane_link_resolve("hover".into(), params);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&plugin_root);
+        assert!(
+            matches!(
+                response_result(&response),
+                ResponseResult::PaneLinkResolved { regions } if !regions.is_empty()
+            ),
+            "plain-text path hover should resolve regions, got {response}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_link_activate_opens_plain_text_path_through_plugin_handler() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("path-activate")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let root = unique_temp_path("pane-link-path-activate");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("open.ts");
+        std::fs::write(&file, "export {}\n").unwrap();
+
+        let plugin_root = unique_temp_path("pane-link-path-activate-plugin");
+        write_manifest_content(
+            &plugin_root,
+            r#"
+id = "example.path-activate"
+name = "Path Activate"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Open path"
+command = ["true"]
+
+[[link_handlers]]
+id = "file-path"
+title = "Open file path"
+pattern = "^(/|~/|\\./|\\.\\./|[A-Za-z0-9._-]+/)"
+action = "open"
+"#,
+        );
+        link_manifest(&mut app, &plugin_root);
+
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 4);
+        let candidate = format!("{}:7", file.display());
+        runtime.test_process_pty_bytes(format!("open {candidate} now").as_bytes());
+        let revision = runtime.content_seq();
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        let params = PaneLinkActivateParams {
+            pane_id: public_id,
+            viewport_row: 0,
+            col: 8,
+            content_revision: Some(revision),
+            offset_from_bottom: Some(0),
+        };
+        let response = app.handle_pane_link_activate("click".into(), params);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&plugin_root);
+        assert!(
+            matches!(
+                response_result(&response),
+                ResponseResult::PaneLinkActivated { url: Some(url), handled: true }
+                    if url == candidate
+            ),
+            "plain-text path click should invoke the plugin with the candidate, got {response}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_link_rejects_tokens_that_are_not_existing_plugin_paths() {
+        for (label, row) in [
+            ("scores", "20/20 and/or"),
+            ("range", "main...origin/main"),
+            ("bare", "README.md"),
+            ("missing", "/definitely/not/here/a.rs"),
+        ] {
+            let mut app = test_app();
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("path-negative")];
+            app.state.ensure_test_terminals();
+            app.state.active = Some(0);
+            app.state.selected = 0;
+
+            let plugin_root = unique_temp_path("pane-link-negative-plugin");
+            write_manifest_content(
+                &plugin_root,
+                r#"
+id = "example.path-negative"
+name = "Path Negative"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Open path"
+command = ["true"]
+
+[[link_handlers]]
+id = "file-path"
+title = "Open file path"
+pattern = "^(/|~/|\\./|\\.\\./|[A-Za-z0-9._-]+/)"
+action = "open"
+"#,
+            );
+            link_manifest(&mut app, &plugin_root);
+
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let public_id = app.public_pane_id(0, pane_id).unwrap();
+            let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 4);
+            runtime.test_process_pty_bytes(row.as_bytes());
+            let revision = runtime.content_seq();
+            app.terminal_runtimes.insert(terminal_id, runtime);
+
+            let params = PaneLinkActivateParams {
+                pane_id: public_id,
+                viewport_row: 0,
+                col: 2,
+                content_revision: Some(revision),
+                offset_from_bottom: Some(0),
+            };
+            let resolved = app.handle_pane_link_resolve("hover".into(), params.clone());
+            let activated = app.handle_pane_link_activate("click".into(), params);
+
+            let _ = std::fs::remove_dir_all(&plugin_root);
+            assert!(
+                matches!(
+                    response_result(&resolved),
+                    ResponseResult::PaneLinkResolved { regions } if regions.is_empty()
+                ),
+                "{label}: expected no hover regions, got {resolved}"
+            );
+            assert!(
+                matches!(
+                    response_result(&activated),
+                    ResponseResult::PaneLinkActivated {
+                        url: None,
+                        handled: false
+                    }
+                ),
+                "{label}: click should fall through, got {activated}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_link_hover_resolves_osc8_file_uri_when_plugin_matches() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("osc8-path")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let plugin_root = unique_temp_path("pane-link-osc8-plugin");
+        write_manifest_content(
+            &plugin_root,
+            r#"
+id = "example.osc8-path"
+name = "OSC8 Path"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Open URI"
+command = ["true"]
+
+[[link_handlers]]
+id = "file-uri"
+title = "Open file URI"
+pattern = "^file://"
+action = "open"
+"#,
+        );
+        link_manifest(&mut app, &plugin_root);
+
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_id = app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 4);
+        runtime.test_process_pty_bytes(
+            b"\x1b]8;;file:///repo/src/open.ts\x1b\\open\x1b]8;;\x1b\\ here",
+        );
+        let revision = runtime.content_seq();
+        app.terminal_runtimes.insert(terminal_id, runtime);
+
+        let params = PaneLinkActivateParams {
+            pane_id: public_id,
+            viewport_row: 0,
+            col: 1,
+            content_revision: Some(revision),
+            offset_from_bottom: Some(0),
+        };
+        let response = app.handle_pane_link_resolve("hover".into(), params.clone());
+        assert!(
+            matches!(
+                response_result(&response),
+                ResponseResult::PaneLinkResolved { regions }
+                    if regions
+                        == vec![crate::api::schema::PaneLinkRegion {
+                            row: 0,
+                            start_col: 0,
+                            end_col: 3,
+                        }]
+            ),
+            "OSC 8 file:// hover should underline the label, got {response}"
+        );
+
+        app.state.installed_plugins.clear();
+        let response = app.handle_pane_link_resolve("hover".into(), params);
+        let _ = std::fs::remove_dir_all(&plugin_root);
+        assert!(
+            matches!(
+                response_result(&response),
+                ResponseResult::PaneLinkResolved { regions } if regions.is_empty()
+            ),
+            "OSC 8 file:// hover without a matching handler must not underline, got {response}"
+        );
     }
 
     fn test_app() -> App {

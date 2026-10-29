@@ -1094,6 +1094,55 @@ pub(super) fn url_byte_range(text: &str, clicked_byte: usize) -> Option<std::ops
     Some(start..end)
 }
 
+/// The plain-text path token under the click, when the target is terminal text.
+pub(super) fn path_candidate_from_link_target(target: crate::ghostty::LinkTarget) -> Option<String> {
+    match target {
+        crate::ghostty::LinkTarget::Uri(_) => None,
+        crate::ghostty::LinkTarget::Text { text, clicked_byte } => {
+            let range = path_byte_range(&text, clicked_byte)?;
+            Some(text[range].to_owned())
+        }
+    }
+}
+
+/// Byte range of the path-shaped token under `clicked_byte`. Filesystem and
+/// plugin gates belong to the caller; this only recognizes path syntax.
+pub(super) fn path_byte_range(text: &str, clicked_byte: usize) -> Option<std::ops::Range<usize>> {
+    let clicked_idx = text.get(..clicked_byte)?.chars().count();
+    let cells = text_cells(text);
+    let span = quoted_path_span_at_column(&cells, clicked_idx)
+        .or_else(|| token_span_at_column(&cells, clicked_idx))?;
+    let start = byte_index_for_cell(text, span.start);
+    let end = byte_index_after_cell(text, span.end);
+    path_link_candidate(text.get(start..end)?)?;
+    Some(start..end)
+}
+
+/// Anchored-slash gate: `/abs`, `~/x`, `./x`, `../x`, `file:///x`, or a
+/// `segment/…` relative path. Rejects bare words, range tokens, and other
+/// URI schemes.
+fn path_link_candidate(candidate: &str) -> Option<&str> {
+    if candidate.contains("...") {
+        return None;
+    }
+    if let Some((scheme, _)) = candidate.split_once("://") {
+        return scheme.eq_ignore_ascii_case("file").then_some(candidate);
+    }
+    if candidate.starts_with('/')
+        || candidate.starts_with("~/")
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+    {
+        return Some(candidate);
+    }
+    let (head, _) = candidate.split_once('/')?;
+    (!head.is_empty() && head.chars().all(is_relative_path_head_char)).then_some(candidate)
+}
+
+fn is_relative_path_head_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')
+}
+
 fn token_span_at_column(cells: &[TextCell], clicked_idx: usize) -> Option<CellSpan> {
     if is_word_separator(cells[clicked_idx].ch) {
         return None;

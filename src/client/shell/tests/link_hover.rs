@@ -379,6 +379,27 @@ fn ctrl_hover_render_scale_profile() {
 }
 
 #[test]
+fn ctrl_hover_delegates_non_web_osc8_links_to_the_server() {
+    let mut state = hover_state();
+    let mut next = surface();
+    next.surface_revision += 1;
+    next.frame.hyperlinks.push("file:///repo/src/open.ts".into());
+    next.frame.cells[1].hyperlink = Some(0);
+    state.set_pane_surface(next);
+    let mouse = hover_mouse(&state, 1, 0);
+    let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]);
+    assert!(
+        matches!(
+            &outcome.actions[..],
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(&request.method, crate::api::schema::Method::PaneLinkResolve(_))
+        ),
+        "non-web OSC-8 hover must ask the server, got {:?}",
+        outcome.actions.len()
+    );
+}
+
+#[test]
 fn ctrl_hover_groups_contiguous_same_destination_cells_without_server_query() {
     let mut state = hover_state();
     state.set_endpoint_methods(Some(vec![]));

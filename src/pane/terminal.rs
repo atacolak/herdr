@@ -47,6 +47,18 @@ const MODE_MOUSE_X10: u16 = 9;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
 const MODE_MOUSE_BUTTON_MOTION: u16 = 1002;
 const MODE_MOUSE_ANY_MOTION: u16 = 1003;
+const LATCHED_MOUSE_MODES: [u16; 8] = [
+    MODE_MOUSE_X10,
+    MODE_MOUSE_PRESS_RELEASE,
+    MODE_MOUSE_BUTTON_MOTION,
+    MODE_MOUSE_ANY_MOTION,
+    crate::ghostty::MODE_MOUSE_UTF8,
+    crate::ghostty::MODE_MOUSE_SGR,
+    crate::ghostty::MODE_MOUSE_ALTERNATE_SCROLL,
+    crate::ghostty::MODE_MOUSE_SGR_PIXELS,
+];
+const LATCHED_MOUSE_MODE_RESET_ANSI: &[u8] =
+    b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollMetrics {
@@ -442,6 +454,10 @@ impl PaneTerminal {
 
     pub fn mouse_reporting_enabled(&self) -> bool {
         self.ghostty.mouse_reporting_enabled()
+    }
+
+    pub fn clear_latched_mouse_mode(&self) -> bool {
+        self.ghostty.clear_latched_mouse_mode()
     }
 
     pub fn modify_other_keys_level(&self) -> u8 {
@@ -1136,6 +1152,12 @@ fn text_fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
+fn latched_mouse_mode_enabled(terminal: &crate::ghostty::Terminal) -> bool {
+    LATCHED_MOUSE_MODES
+        .into_iter()
+        .any(|mode| terminal.mode_get(mode).unwrap_or(false))
+}
+
 impl GhosttyPaneTerminal {
     pub fn new(
         mut terminal: crate::ghostty::Terminal,
@@ -1817,6 +1839,17 @@ impl GhosttyPaneTerminal {
         self.core
             .lock()
             .is_ok_and(|core| core.terminal.mouse_tracking_enabled().unwrap_or(false))
+    }
+
+    pub fn clear_latched_mouse_mode(&self) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        if !latched_mouse_mode_enabled(&core.terminal) {
+            return false;
+        }
+        core.terminal.write(LATCHED_MOUSE_MODE_RESET_ANSI);
+        true
     }
 
     pub fn modify_other_keys_level(&self) -> u8 {
@@ -5392,6 +5425,84 @@ mod tests {
 
         assert_eq!(exact.as_deref(), Some(&b"\x1b[<35;48;139M"[..]));
         assert_eq!(fallback.as_deref(), Some(&b"\x1b[<35;5;7M"[..]));
+    }
+
+    #[test]
+    fn live_tui_receives_mouse_reports_while_tracking_is_enabled() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        terminal.write(b"\x1b[?1000h\x1b[?1006h");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let press = pane.encode_mouse_button(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            crate::input::mouse::Position::Cell { column: 29, row: 9 },
+            crossterm::event::KeyModifiers::empty(),
+        );
+        let wheel = pane.encode_mouse_wheel(
+            crossterm::event::MouseEventKind::ScrollDown,
+            crate::input::mouse::Position::Cell {
+                column: 30,
+                row: 20,
+            },
+            crossterm::event::KeyModifiers::empty(),
+        );
+
+        assert_eq!(press.as_deref(), Some(&b"\x1b[<0;30;10M"[..]));
+        assert_eq!(wheel.as_deref(), Some(&b"\x1b[<65;31;21M"[..]));
+    }
+
+    #[test]
+    fn latched_mouse_mode_is_cleared_when_a_bare_shell_reclaims_the_pane() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        terminal.write(b"\x1b[?1000h\x1b[?1006h");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let press = |pane: &GhosttyPaneTerminal| {
+            pane.encode_mouse_button(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                crate::input::mouse::Position::Cell { column: 29, row: 9 },
+                crossterm::event::KeyModifiers::empty(),
+            )
+        };
+        let wheel = |pane: &GhosttyPaneTerminal| {
+            pane.encode_mouse_wheel(
+                crossterm::event::MouseEventKind::ScrollDown,
+                crate::input::mouse::Position::Cell {
+                    column: 30,
+                    row: 20,
+                },
+                crossterm::event::KeyModifiers::empty(),
+            )
+        };
+
+        assert_eq!(press(&pane).as_deref(), Some(&b"\x1b[<0;30;10M"[..]));
+        assert_eq!(wheel(&pane).as_deref(), Some(&b"\x1b[<65;31;21M"[..]));
+
+        assert!(pane.clear_latched_mouse_mode());
+
+        assert!(!pane.mouse_reporting_enabled());
+        assert_eq!(
+            pane.wheel_routing(),
+            Some(crate::pane::WheelRouting::HostScroll)
+        );
+        assert_eq!(press(&pane), None);
+        assert_eq!(wheel(&pane), None);
+    }
+
+    #[test]
+    fn clearing_latched_mouse_mode_leaves_shell_text_untouched() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        terminal.write(b"$ git status\r\nclean\r\n$ \x1b[?1000h\x1b[?1006h");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let before = pane.visible_text();
+
+        assert!(pane.clear_latched_mouse_mode());
+
+        assert_eq!(pane.visible_text(), before);
+        assert!(before.contains("git status"));
+        assert!(!pane.clear_latched_mouse_mode());
     }
 
     #[test]

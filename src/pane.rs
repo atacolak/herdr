@@ -423,6 +423,13 @@ fn foreground_shell_agent_action(
     ForegroundShellAgentAction::ObserveProbe
 }
 
+fn should_clear_latched_mouse_mode(
+    previous_foreground_is_pane_shell: Option<bool>,
+    foreground_is_pane_shell: bool,
+) -> bool {
+    previous_foreground_is_pane_shell == Some(false) && foreground_is_pane_shell
+}
+
 /// Drops retained OSC evidence when changing away from an identified agent.
 /// First acquisition keeps bytes that the newly identified process may have
 /// emitted before the process probe recognized it.
@@ -761,6 +768,7 @@ fn spawn_basic_detection_task(
         let mut last_visible_signal_refresh = None;
         let mut last_process_check = std::time::Instant::now();
         let mut last_foreground_pgid = None;
+        let mut last_foreground_is_pane_shell = None;
         let mut has_process_probe = false;
         let mut acquisition_started_at = None;
         let mut last_content_change_at = None;
@@ -789,6 +797,7 @@ fn spawn_basic_detection_task(
                     last_visible_signal_refresh = None;
                     last_process_check = std::time::Instant::now();
                     last_foreground_pgid = None;
+                    last_foreground_is_pane_shell = None;
                     has_process_probe = false;
                     acquisition_started_at = None;
                     last_content_change_at = None;
@@ -848,6 +857,13 @@ fn spawn_basic_detection_task(
                 let tracked_process_group_id =
                     process_group_for_change_tracking(foreground_pgid, process_group_id);
                 let foreground_is_pane_shell = probe.foreground_is_pane_shell;
+                if should_clear_latched_mouse_mode(
+                    last_foreground_is_pane_shell,
+                    foreground_is_pane_shell,
+                ) {
+                    terminal.clear_latched_mouse_mode();
+                }
+                last_foreground_is_pane_shell = Some(foreground_is_pane_shell);
                 let mut new_agent = probe.agent;
                 if let Some(suppressed_agent) = suppressed_agent {
                     if new_agent == Some(suppressed_agent) {
@@ -2644,6 +2660,7 @@ impl PaneRuntime {
                 #[cfg(windows)]
                 let mut last_observation = (Instant::now(), Some(0));
                 let mut last_foreground_pgid = None;
+                let mut last_foreground_is_pane_shell = None;
                 let mut has_process_probe = false;
                 let mut acquisition_started_at = None;
                 let mut last_content_change_at = None;
@@ -2682,6 +2699,7 @@ impl PaneRuntime {
                             state = AgentState::Unknown;
                             last_visible_idle = false;
                             last_foreground_pgid = None;
+                            last_foreground_is_pane_shell = None;
                             has_process_probe = false;
                             acquisition_started_at = None;
                             last_content_change_at = None;
@@ -2776,6 +2794,15 @@ impl PaneRuntime {
                                 process_group_id,
                             );
                             let foreground_is_pane_shell = probe.foreground_is_pane_shell;
+                            if should_clear_latched_mouse_mode(
+                                last_foreground_is_pane_shell,
+                                foreground_is_pane_shell,
+                            ) && terminal.clear_latched_mouse_mode()
+                                && render_dirty.request_pty(pane_id)
+                            {
+                                render_notify.notify_one();
+                            }
+                            last_foreground_is_pane_shell = Some(foreground_is_pane_shell);
                             let mut new_agent = probe.agent;
 
                             if let Some(suppressed_agent) = suppressed_agent {
@@ -5033,6 +5060,14 @@ mod tests {
             foreground_shell_agent_action(Some(Agent::Claude), Some(Agent::OpenCode), true, false,),
             ForegroundShellAgentAction::ObserveProbe
         );
+    }
+
+    #[test]
+    fn latched_mouse_mode_reset_requires_a_confirmed_return_to_the_pane_shell() {
+        assert!(!should_clear_latched_mouse_mode(None, true));
+        assert!(!should_clear_latched_mouse_mode(Some(true), true));
+        assert!(!should_clear_latched_mouse_mode(Some(false), false));
+        assert!(should_clear_latched_mouse_mode(Some(false), true));
     }
 
     fn foreground_process(pid: u32, name: &str) -> crate::platform::ForegroundProcess {

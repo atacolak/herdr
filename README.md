@@ -7,6 +7,7 @@
 > - **Capabilities:**
 >   - [`cap/kitty-keyboard`](https://github.com/atacolak/herdr/tree/cap/kitty-keyboard) — skip stacking kitty keyboard protocol when already inside kitty
 >   - [`cap/path-links`](https://github.com/atacolak/herdr/tree/cap/path-links) — underline, hover, and Ctrl+Click plain-text file paths and non-web OSC 8 links through plugin link handlers
+>   - [`cap/reset-mouse-on-shell`](https://github.com/atacolak/herdr/tree/cap/reset-mouse-on-shell) — clear mouse reporting a crashed pane child left latched once the bare shell owns the foreground
 >
 > Rebuild from upstream `master` + current `cap/*` tips. Do not implement features here.
 
